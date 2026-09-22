@@ -1,42 +1,45 @@
 # cPanel Non-WordPress Account Detector
 
-A lightweight Bash utility for cPanel/WHM server administrators to identify and audit cPanel accounts that do not have WordPress installed. The script scans all domain document roots (primary, addon, and subdomains) for each user and exports a CSV report of accounts without WordPress.
+A lightweight administrative utility for cPanel/WHM servers to identify and audit cPanel accounts that do not have WordPress installed. Available in both **Bash** and **Python 3** implementations.
+
+Both scripts scan all domain document roots (primary, addon, and subdomains) for each user and export a CSV report of accounts without WordPress.
+
+---
+
+## Implementations
+
+| Script | Runtime | Best For | Key Features |
+| :--- | :--- | :--- | :--- |
+| [`non-wp-detect.sh`](file:///home/gekkostate/Documents/repo/cpanel-detect-non-wp-user/non-wp-detect.sh) | `/bin/bash` | Quick audits, zero-install environments | Pure shell using standard POSIX utilities (`awk`, `grep`, `cut`, `printf`). |
+| [`non-wp-detect.py`](file:///home/gekkostate/Documents/repo/cpanel-detect-non-wp-user/non-wp-detect.py) | `Python 3` | Robust reporting, automated pipelines | Modular design, sorted user ordering, resilient utf-8 handling, standard library `csv.DictWriter`. |
 
 ---
 
 ## Features
 
-- **Multi-domain Document Root Discovery**: Reads `/var/cpanel/userdata/<user>` to locate document roots across all domains attached to an account (primary domains, addon domains, and subdomains).
+- **Multi-Domain Document Root Discovery**: Parses `/var/cpanel/userdata/<user>` to locate document roots across all domains attached to an account (primary domains, addon domains, and subdomains).
 - **Public HTML Fallback**: Checks standard `/home/<user>/public_html` if userdata configuration is missing or empty.
-- **Accurate WordPress Signatures**: Checks for core WordPress identifiers:
+- **Accurate WordPress Signatures**: Inspects discovered document roots for core WordPress indicators:
   - `wp-config.php`
   - `wp-login.php`
   - `wp-content/`
-- **Formatted Console Output**: Displays a neat, aligned ASCII table in real time as the scan progresses.
-- **CSV Export**: Automatically logs missing installations to `cpanel_accounts_without_wordpress.csv` for reporting and migration planning.
+- **Formatted Console Output**: Displays a formatted ASCII table in real time.
+- **CSV Export**: Automatically logs missing installations to `cpanel_accounts_without_wordpress.csv`.
 
 ---
 
 ## Prerequisites
 
 ### 1. Server Environment
-- **Platform**: cPanel & WHM Linux server (CentOS, CloudLinux, AlmaLinux, Rocky Linux, or Ubuntu).
+- **Platform**: cPanel & WHM Linux server (CloudLinux, AlmaLinux, Rocky Linux, CentOS, or Ubuntu).
 - **Shell**: Bash (`/bin/bash`).
+- **Python (for Python script)**: Python 3.6+ installed (`python3`). No third-party packages (`pip`) required; uses standard library only (`os`, `glob`, `csv`, `pwd`).
 
 ### 2. User Privileges
-- **Root Access (`EUID == 0`)**: The script must be run as `root` (or via `sudo`) to inspect `/var/cpanel/` and read user home directories.
+- **Root Access (`EUID == 0`)**: Both scripts must be executed as `root` (or via `sudo`) to read protected directories under `/var/cpanel/` and user home directories (`/home/<user>/`).
 
-### 3. Core System Utilities
-The script depends only on standard Unix core tools available by default on all cPanel servers:
-- `bash`
-- `awk`
-- `grep`
-- `cut`
-- `basename`
-- `printf`
-
-### 4. Required File System Paths
-The script relies on standard cPanel directory structures:
+### 3. Required File System Paths
+The scripts rely on standard cPanel directory structures:
 | Path | Purpose |
 | :--- | :--- |
 | `/var/cpanel/users/` | List of cPanel accounts and primary domain mappings (`domain=`). |
@@ -45,114 +48,108 @@ The script relies on standard cPanel directory structures:
 
 ---
 
-## How It Works
+## Architecture & Workflow
 
 ```mermaid
 flowchart TD
-    A[Start: non-wp-detect.sh] --> B{Is EUID == 0?}
-    B -- No --> C[Exit: Error - Run as root]
-    B -- Yes --> D[Initialize CSV header & Console Table]
-    D --> E[Iterate /var/cpanel/users/*]
+    A[Start: Script Execution] --> B{Is EUID == 0 / Root?}
+    B -- No --> C[Exit: Error - Must be run as root]
+    B -- Yes --> D[Initialize Output & Read cPanel Users]
+    D --> E[Iterate Users]
     E --> F[Extract Username & Primary Domain]
     F --> G[Parse Document Roots from /var/cpanel/userdata/<user>/*]
-    G --> H{Found WordPress Files in any DocRoot?<br/>wp-config.php / wp-login.php / wp-content}
-    H -- Yes --> I[Mark has_wp=1]
+    G --> H{Found WP Files in any DocRoot?<br/>wp-config.php / wp-login.php / wp-content}
+    H -- Yes --> I[Mark as WordPress Present]
     H -- No --> J{Check Fallback: /home/<user>/public_html}
     J -- Found --> I
-    J -- Not Found --> K[Print to Console & Append to CSV]
+    J -- Not Found --> K[Log to Console & Queue for CSV]
     I --> L{More Users?}
     K --> L
     L -- Yes --> E
-    L -- No --> M[Display Scan Summary & Exit]
+    L -- No --> M[Export cpanel_accounts_without_wordpress.csv]
+    M --> N[Display Summary and Exit]
 ```
 
-### Detailed Script Functions
+---
 
-1. **Root Verification (`lines 5-8`)**
-   Checks `$EUID`. If the user is not root, displays an error and exits with code 1.
+## Function Breakdown
 
-2. **Output Initialization (`lines 10-21`)**
-   Creates (or truncates) `cpanel_accounts_without_wordpress.csv` and writes the header:
-   ```csv
-   Username,Primary Domain,Status
-   ```
-   Prints table headers to stdout.
+### Python Version ([`non-wp-detect.py`](file:///home/gekkostate/Documents/repo/cpanel-detect-non-wp-user/non-wp-detect.py))
 
-3. **User Enumeration (`lines 24-28`)**
-   Iterates through each account file located in `/var/cpanel/users/`. The filename corresponds to the cPanel username.
+- `get_cpanel_users()`: Reads directory entries in `/var/cpanel/users` to discover all valid accounts.
+- `get_user_primary_domain(username)`: Reads `/var/cpanel/users/<username>` with UTF-8 encoding (ignoring bad bytes) and extracts `domain=`. Returns `"Unknown"` if missing.
+- `get_user_docroots(username)`:
+  - Iterates through `/var/cpanel/userdata/<username>/*` (skipping `.cache` files and subdirectories).
+  - Parses `documentroot:` entries, deduplicating paths.
+  - Falls back to `/home/<username>/public_html` if no document roots are found.
+- `has_wordpress(docroots)`: Iterates through document roots and returns `True` if `wp-config.php`, `wp-login.php`, or `wp-content/` exists.
+- `main()`: Enforces root privilege check (`os.geteuid() != 0`), sorts users alphabetically, prints live table, and exports results using `csv.DictWriter`.
 
-4. **Primary Domain Parsing (`lines 29-32`)**
-   Extracts the account's primary domain using `grep '^domain='` from the cPanel user configuration file.
+### Bash Version ([`non-wp-detect.sh`](file:///home/gekkostate/Documents/repo/cpanel-detect-non-wp-user/non-wp-detect.sh))
 
-5. **Document Root Inspection (`lines 36-51`)**
-   Iterates through non-cache configuration files in `/var/cpanel/userdata/$user/`. Extracts the `documentroot:` entry for each domain and checks if any of the following exist inside that directory:
-   - `wp-config.php`
-   - `wp-login.php`
-   - `wp-content/`
-
-6. **Fallback Web Root Check (`lines 54-61`)**
-   If no WordPress installation was found in the vhost document roots, checks `/home/$user/public_html` directly.
-
-7. **Logging and Reporting (`lines 64-69`)**
-   If no WordPress installation is detected across any examined paths:
-   - Prints the user and domain to the console table.
-   - Appends a record to the CSV file.
-   - Increments the total counter.
-
-8. **Summary (`lines 72-74`)**
-   Outputs the final tally of accounts without WordPress and the absolute path to the generated CSV report.
+- **Root check (`lines 5-8`)**: Verifies `$EUID -eq 0`.
+- **User loop (`lines 24-28`)**: Iterates `/var/cpanel/users/*` using `basename`.
+- **Domain extraction (`lines 29-32`)**: Uses `grep '^domain='` and `cut -d= -f2`.
+- **Docroot parsing (`lines 36-51`)**: Loops over `/var/cpanel/userdata/$user/*`, greps `documentroot:`, and checks WordPress indicator paths.
+- **Fallback (`lines 54-61`)**: Inspects `/home/$user/public_html` if `has_wp` is 0.
+- **Output & CSV (`lines 64-74`)**: Outputs with `printf` and appends CSV lines directly.
 
 ---
 
 ## Usage
 
-### 1. Download or Place the Script
-Place [non-wp-detect.sh](file:///home/gekkostate/Documents/repo/cpanel-detect-non-wp-user/non-wp-detect.sh) on your cPanel server (e.g. in `/root/` or any administrative directory).
-
-### 2. Grant Execute Permission
+Make scripts executable first:
 ```bash
-chmod +x non-wp-detect.sh
+chmod +x non-wp-detect.sh non-wp-detect.py
 ```
 
-### 3. Execute as Root
+### Option A: Run the Python Script (Recommended)
 ```bash
-./non-wp-detect.sh
+sudo ./non-wp-detect.py
 ```
-or
+*Or directly via python3:*
+```bash
+sudo python3 non-wp-detect.py
+```
+
+### Option B: Run the Bash Script
 ```bash
 sudo ./non-wp-detect.sh
 ```
 
-### Example Console Output
+---
+
+## Output Examples
+
+### Console Output
 ```text
-=================================================================
-Scanning cPanel accounts for missing WordPress installations...
 =================================================================
 USERNAME        | PRIMARY DOMAIN            | STATUS
 -----------------------------------------------------------------
-clienta         | clienta-example.com       | No WordPress Found
-staticuser      | portfolio-static.org      | No WordPress Found
------------------------------------------------------------------
+alpha_user      | alpha-example.com         | No WordPress Found
+static_site     | mystaticsite.org          | No WordPress Found
+test_account    | test.internal             | No WordPress Found
 =================================================================
-Scan complete. Found 2 accounts without WordPress.
+Scan complete. Found 3 accounts without WordPress.
 [+] Results successfully exported to: /root/cpanel_accounts_without_wordpress.csv
 ```
 
-### Example CSV Output
-`cpanel_accounts_without_wordpress.csv`:
+### Generated CSV Report
+File: `cpanel_accounts_without_wordpress.csv`
 ```csv
 Username,Primary Domain,Status
-clienta,clienta-example.com,No WordPress Found
-staticuser,portfolio-static.org,No WordPress Found
+alpha_user,alpha-example.com,No WordPress Found
+static_site,mystaticsite.org,No WordPress Found
+test_account,test.internal,No WordPress Found
 ```
 
 ---
 
-## Notes & Recommendations
+## Considerations & Tips
 
-1. **Unused Temporary File**:
-   Line 11 allocates a temporary file via `TEMP_FILE=$(mktemp)`, but `TEMP_FILE` is not currently referenced in the script. You can safely remove this line or add a trap (`trap 'rm -f "$TEMP_FILE"' EXIT`) if you plan to use it for intermediate filtering.
-2. **Subdirectory WordPress Installations**:
-   The script checks the root of each domain's `documentroot` and `/public_html`. If a user installed WordPress in a subfolder (e.g., `public_html/blog/`), this script will treat the account as not having WordPress at root level unless checked recursively.
-3. **Suspended Accounts**:
-   Suspended accounts still exist under `/var/cpanel/users/` and will be scanned. If you wish to filter out suspended accounts, you can check for `SUSPENDED=1` in `/var/cpanel/users/$user`.
+1. **Subdirectory WordPress Installations**:
+   Both scripts check the root level of each domain's document root and `/public_html`. If a user installed WordPress inside a subfolder (e.g. `public_html/blog/`), it will be reported as not having WordPress at root level.
+2. **Suspended Accounts**:
+   Suspended accounts still retain files under `/var/cpanel/users/` and will be scanned. If you wish to exclude suspended users, you can check for `SUSPENDED=1` in their user file.
+3. **Encoding & Special Characters**:
+   The Python script handles non-ASCII characters and UTF-8 decode issues gracefully with `errors="ignore"`.
