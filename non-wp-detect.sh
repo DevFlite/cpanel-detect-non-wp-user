@@ -7,7 +7,6 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 CSV_FILE="cpanel_accounts_without_wordpress.csv"
-TEMP_FILE=$(mktemp)
 
 # Initialize CSV header
 echo "Username,Primary Domain,Status" > "$CSV_FILE"
@@ -20,26 +19,29 @@ echo "-----------------------------------------------------------------"
 
 no_wp_count=0
 
-# Loop through all valid cPanel users based on /var/cpanel/users directory
+# Loop through all valid cPanel user files
 for user_file in /var/cpanel/users/*; do
     [ -f "$user_file" ] || continue
+    # Skip cache or hidden files
+    [[ "$(basename "$user_file")" =~ ^\. ]] && continue
+    
     user=$(basename "$user_file")
 
-    # Extract primary domain
-    domain=$(grep '^domain=' "$user_file" | cut -d= -f2)
+    # Extract primary domain using cPanel's correct 'DNS=' format
+    domain=$(grep -E '^DNS=' "$user_file" | head -n 1 | cut -d= -f2)
     [ -z "$domain" ] && domain="Unknown"
 
     has_wp=0
     userdata_dir="/var/cpanel/userdata/$user"
 
-    # Check all domain document roots (Primary + Addons/Subdomains)
+    # Check all domain document roots (Primary + Addons/Subdomains) via YAML config
     if [ -d "$userdata_dir" ]; then
         for conf in "$userdata_dir"/*; do
             if [ -f "$conf" ] && [[ "$conf" != *.cache ]]; then
-                docroot=$(grep -E '^\s*documentroot:' "$conf" | awk '{print $2}')
+                docroot=$(grep -E '^\s*documentroot:' "$conf" | head -n 1 | awk '{print $2}')
                 
                 if [ -n "$docroot" ] && [ -d "$docroot" ]; then
-                    # Check for core WordPress indicator files/directories
+                    # Check for core WordPress files/directories
                     if [ -f "$docroot/wp-config.php" ] || [ -f "$docroot/wp-login.php" ] || [ -d "$docroot/wp-content" ]; then
                         has_wp=1
                         break
@@ -49,17 +51,17 @@ for user_file in /var/cpanel/users/*; do
         done
     fi
 
-    # Fallback to standard public_html if userdata check found nothing
+    # Fallback: check standard public_html if userdata yielded nothing
     if [ "$has_wp" -eq 0 ]; then
         fallback_dir="/home/$user/public_html"
         if [ -d "$fallback_dir" ]; then
-            if [ -f "$fallback_dir/wp-config.php" ] || [ -f "$fallback_dir/wp-login.php" ] || [ -d "$fallback_dir/wp-content" ]; then
+            if [ -f "$fallback_dir/wp-config.php" ] || [ -f "$fallback_dir/wp-login.php" ] || [ -d "$fallback_dir/public_html/wp-content" ] || [ -d "$fallback_dir/wp-content" ]; then
                 has_wp=1
             fi
         fi
     fi
 
-    # If WordPress is missing across all document roots
+    # If WordPress is missing across all document roots, list it
     if [ "$has_wp" -eq 0 ]; then
         printf "%-15s | %-25s | %s\n" "$user" "$domain" "No WordPress Found"
         echo "$user,$domain,No WordPress Found" >> "$CSV_FILE"

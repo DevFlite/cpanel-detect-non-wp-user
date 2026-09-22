@@ -4,35 +4,91 @@ import glob
 import csv
 import pwd
 
+SYSTEM_USERS = {"system", "nobody", "cpanel", "root"}
+
 def get_cpanel_users():
-    """Retrieves a list of valid cPanel users."""
+    """Retrieves a list of valid cPanel users, excluding system accounts."""
     cpanel_users = []
     users_dir = "/var/cpanel/users"
     if os.path.exists(users_dir):
-        cpanel_users = os.listdir(users_dir)
-    return cpanel_users
+        for entry in os.listdir(users_dir):
+            if entry.startswith(".") or entry in SYSTEM_USERS:
+                continue
+            full_path = os.path.join(users_dir, entry)
+            if os.path.isfile(full_path):
+                cpanel_users.append(entry)
+    return sorted(cpanel_users)
 
 def get_user_primary_domain(username):
-    """Retrieves the primary domain for a cPanel user."""
+    """Retrieves the primary domain for a cPanel user using multiple fallback sources."""
+    # 1. Check /etc/trueuserdomains (standard cPanel mapping: 'domain.com: username')
+    trueuserdomains_path = "/etc/trueuserdomains"
+    if os.path.exists(trueuserdomains_path):
+        try:
+            with open(trueuserdomains_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 2 and parts[1].strip() == username:
+                        return parts[0].strip()
+        except Exception:
+            pass
+
+    # 2. Check /var/cpanel/userdata/<username>/main
+    main_file = f"/var/cpanel/userdata/{username}/main"
+    if os.path.exists(main_file):
+        try:
+            with open(main_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.strip().startswith("main_domain:"):
+                        domain = line.split(":", 1)[1].strip().strip("'\"")
+                        if domain:
+                            return domain
+        except Exception:
+            pass
+
+    # 3. Check /var/cpanel/users/<username>
     user_file = f"/var/cpanel/users/{username}"
     if os.path.exists(user_file):
         try:
             with open(user_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    if line.startswith("domain="):
-                        return line.split("=", 1)[1].strip()
+                    line_clean = line.strip()
+                    for prefix in ("DNS=", "domain=", "DOMAIN="):
+                        if line_clean.startswith(prefix):
+                            domain = line_clean.split("=", 1)[1].strip().strip("'\"")
+                            if domain:
+                                return domain
         except Exception:
             pass
+
     return "Unknown"
 
 def get_user_docroots(username):
-    """Parses cPanel userdata files to find all document roots for a user."""
-    docroots = []
+    """Collects all document roots for a user using multiple discovery methods."""
+    docroots = set()
+
+    # 1. Check /etc/userdatadomains (consolidated format: domain: user==owner==type==parent==docroot==...)
+    userdatadomains_path = "/etc/userdatadomains"
+    if os.path.exists(userdatadomains_path):
+        try:
+            with open(userdatadomains_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line_clean = line.strip()
+                    if f": {username}==" in line_clean:
+                        parts = line_clean.split("==")
+                        if len(parts) >= 5:
+                            dr = parts[4].strip().strip("'\"")
+                            if dr:
+                                docroots.add(dr)
+        except Exception:
+            pass
+
+    # 2. Parse individual /var/cpanel/userdata/<username>/* files
     userdata_dir = f"/var/cpanel/userdata/{username}"
-    
     if os.path.exists(userdata_dir):
         for conf_file in glob.glob(os.path.join(userdata_dir, "*")):
-            if conf_file.endswith(".cache") or os.path.isdir(conf_file):
+            base_conf = os.path.basename(conf_file)
+            if conf_file.endswith(".cache") or base_conf == "main" or os.path.isdir(conf_file):
                 continue
             try:
                 with open(conf_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -40,31 +96,50 @@ def get_user_docroots(username):
                         if line.strip().startswith("documentroot:"):
                             parts = line.split(":", 1)
                             if len(parts) > 1:
-                                docroot = parts[1].strip()
-                                if docroot and docroot not in docroots:
-                                    docroots.append(docroot)
+                                dr = parts[1].strip().strip("'\"")
+                                if dr:
+                                    docroots.add(dr)
             except Exception:
                 continue
-                
-    # Fallback if no userdata found: check standard public_html
-    if not docroots:
-        fallback = f"/home/{username}/public_html"
-        if os.path.exists(fallback):
-            docroots.append(fallback)
-            
-    return docroots
+
+    # 3. Dynamic fallback using actual home directory (supports /home, /home2, etc.)
+    try:
+        user_home = pwd.getpwnam(username).pw_dir
+    except KeyError:
+        user_home = f"/home/{username}"
+
+    fallback_public_html = os.path.join(user_home, "public_html")
+    if os.path.isdir(fallback_public_html):
+        docroots.add(fallback_public_html)
+
+    return list(docroots)
 
 def has_wordpress(docroots):
     """Checks if any of the given document roots contain a WordPress installation."""
     for dr in docroots:
-        if not os.path.exists(dr):
+        if not os.path.isdir(dr):
             continue
+
+        # Check root level of document root
         wp_config = os.path.join(dr, "wp-config.php")
         wp_login = os.path.join(dr, "wp-login.php")
         wp_content = os.path.join(dr, "wp-content")
-        
+
         if os.path.isfile(wp_config) or os.path.isfile(wp_login) or os.path.isdir(wp_content):
             return True
+
+        # Check 1-level subdirectories (e.g. /public_html/wordpress, /public_html/wp, /public_html/blog)
+        try:
+            for item in os.listdir(dr):
+                sub_dir = os.path.join(dr, item)
+                if os.path.isdir(sub_dir):
+                    if (os.path.isfile(os.path.join(sub_dir, "wp-config.php")) or
+                        os.path.isfile(os.path.join(sub_dir, "wp-login.php")) or
+                        os.path.isdir(os.path.join(sub_dir, "wp-content"))):
+                        return True
+        except (PermissionError, OSError):
+            continue
+
     return False
 
 def main():
@@ -74,20 +149,22 @@ def main():
 
     csv_filename = "cpanel_accounts_without_wordpress.csv"
     users = get_cpanel_users()
-    
+
     print("=" * 65)
-    print(f"{'USERNAME':<15} | {'PRIMARY DOMAIN':<25} | {'STATUS'}")
+    print("Scanning cPanel accounts for missing WordPress installations...")
+    print("=" * 65)
+    print(f"{'USERNAME':<15} | {'PRIMARY DOMAIN':<30} | {'STATUS'}")
     print("-" * 65)
 
     no_wp_count = 0
     results = []
 
-    for user in sorted(users):
+    for user in users:
         primary_domain = get_user_primary_domain(user)
         docroots = get_user_docroots(user)
-        
+
         if not has_wordpress(docroots):
-            print(f"{user:<15} | {primary_domain:<25} | No WordPress Found")
+            print(f"{user:<15} | {primary_domain:<30} | No WordPress Found")
             results.append({
                 "Username": user,
                 "Primary Domain": primary_domain,
